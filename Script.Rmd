@@ -1,0 +1,159 @@
+---
+title: "Amplicon_sequencing_BASH"
+author: "Bosco Gracia Alvira"
+date: "2022-08-24"
+output: html_document
+---
+
+## Creating the directories
+
+```{bash Creating directories, message=FALSE, warning=FALSE, results='hide'}
+cd ~/PhD/Amplicon_sequencing/Old_16S
+
+mkdir 01.Raw_data
+mkdir 02.Rm_adapters
+mkdir 03.DADA2
+mkdir 04.Figaro
+mkdir 04.Data_analysis
+mkdir 05.BLAST
+
+RAW=~/PhD/Amplicon_sequencing/Old_16S/01.Raw_data
+RM=~/PhD/Amplicon_sequencing/Old_16S/02.Rm_adapters
+
+mkdir $RM/fastq
+mkdir $RM/fastqc
+mkdir $RM/fastq_wo_adapt
+mkdir $RM/fastqc_wo_adapt
+mkdir 03.DADA2/fastq_filtered/
+mkdir 04.Data_analysis/plots/
+mkdir 05.BLAST/database
+mkdir 05.BLAST/output
+```
+
+## Data retrieval from VetLinux
+
+```{bash Data retrieval, message=FALSE, warning=FALSE, results='hide'}
+cd 01.Raw_data
+
+scp vetlinux05@pgnsrv043.vu-wien.ac.at:/home/vetlinux05/Bosco/Microbiome_DsimFl/05Data16S/"*".bam .
+scp vetlinux05@pgnsrv043.vu-wien.ac.at:/home/vetlinux05/Bosco/Microbiome_DsimFl/05Data16S/base/"*".bam .
+scp vetlinux05@pgnsrv043.vu-wien.ac.at:/home/vetlinux05/Bosco/Microbiome_DsimFl/Info/16S_barcodes.txt . #I have changed line 76, in COLD F80 replicate 5, pool was  492 for 491
+```
+
+## Renaming the files consistently
+
+THIS HAS BEEN A PAIN IN THE ASS
+
+Alright. First of all I have MANUALLY removed some symbols from the 16S_barcodes.txt file that were not recognised by awk. Then, I have re-named the replicate column of some samples because there were two technical replicates (e.g. 52 instead of 5, meaning 2nd replicate of the replicate 5).
+
+And then, I have used the following awk command to modify the barcodes table and make it suitable for renaming the .bam files into informative names. Also, the barcodes were wrong: in the info sheet they were with N but in the file name that had to be replaced they were with S, so they did not match. EXCEPT FOR ONE, that was right, therefore I have had to rename it manually.
+
+A PAIN IN THE ASS.
+
+```{bash Renaming the files, message=FALSE, warning=FALSE, results='hide'}
+RAW=~/PhD/Amplicon_sequencing/Old_16S/01.Raw_data
+RM=~/PhD/Amplicon_sequencing/Old_16S/02.Rm_adapters
+
+awk -F '\t' 'BEGIN {OFS="\t"} {$2=$2; sub(/ r. ., /, "_", $2); sub(/  r.*/, "", $2); sub(/ r.*/, "", $2); sub(/D. sim FL /, "", $2); sub(/.*) /, "F", $2); sub(/FF/, "F", $2); sub(/  /, "_", $2); sub(/N/, "S", $5); print}' 16S_barcodes.txt > Barcodes.txt
+
+#These files cannot be renamed with the loop, for some reason
+mv Pool_491a_maxMM3_maxN2_N707_N501.bam HOT_F10_42.bam 
+mv Pool_491a_maxMM3_maxN2_N704_S504.bam COLD_F80_5.bam
+
+for i in $(awk -F '\t' 'BEGIN {OFS="-"} $1 != "Pool" {print "Pool_"$1"a_maxMM3_maxN2_"$4"_"$5"\.bam",$2"_"$3}' Barcodes.txt);
+do mv $(echo $i | cut -d "-" -f1) $(echo $i | cut -d "-" -f2).bam;
+done
+
+ls *.bam | cut -d "." -f1 > Sample.list
+```
+
+Now we have the demultiplexed and renamed reads in BAM format. This format is lighter than fastq. I use samtools (v1.15) to transform BAM into fastq again.
+
+```{bash Transforming BAM into Fastq, message=FALSE, warning=FALSE, results='hide'}
+RAW=~/PhD/Amplicon_sequencing/Old_16S/01.Raw_data
+RM=~/PhD/Amplicon_sequencing/Old_16S/02.Rm_adapters
+
+cd 02.Rm_adapters
+
+samtools version
+
+for i in $(cat $RAW/Sample.list);
+do  samtools sort -n -o $RAW/${i}.sorted.bam  $RAW/${i}.bam;
+    samtools fastq -1 $RM/fastq/${i}_1.fq.gz -2 $RM/fastq/${i}_2.fq.gz $RAW/${i}.sorted.bam;
+done
+
+#Five samples were re-sequenced. Therefore, we have two reads files for the same sample. We can concatenate these files.
+for i in 1 2;
+do  cat $RM/fastq/COLD_F80_5_${i}.fq.gz $RM/fastq/COLD_F80_52_${i}.fq.gz > $RM/fastq/COLD_F80_53_${i}.fq.gz; 
+    mv $RM/fastq/COLD_F80_53_${i}.fq.gz $RM/fastq/COLD_F80_5_${i}.fq.gz;
+    rm $RM/fastq/COLD_F80_52_${i}.fq.gz;
+
+    cat $RM/fastq/HOT_F10_4_${i}.fq.gz $RM/fastq/HOT_F10_42_${i}.fq.gz > $RM/fastq/HOT_F10_43_${i}.fq.gz; 
+    mv $RM/fastq/HOT_F10_43_${i}.fq.gz $RM/fastq/HOT_F10_4_${i}.fq.gz;
+    rm $RM/fastq/HOT_F10_42_${i}.fq.gz;
+
+    cat $RM/fastq/HOT_F100_4_${i}.fq.gz $RM/fastq/HOT_F100_42_${i}.fq.gz > $RM/fastq/HOT_F100_43_${i}.fq.gz;
+    mv $RM/fastq/HOT_F100_43_${i}.fq.gz $RM/fastq/HOT_F100_4_${i}.fq.gz;
+    rm $RM/fastq/HOT_F100_42_${i}.fq.gz;
+
+    cat $RM/fastq/HOT_F100_5_${i}.fq.gz $RM/fastq/HOT_F100_52_${i}.fq.gz > $RM/fastq/HOT_F100_53_${i}.fq.gz;
+    mv $RM/fastq/HOT_F100_53_${i}.fq.gz $RM/fastq/HOT_F100_5_${i}.fq.gz;
+    rm $RM/fastq/HOT_F100_52_${i}.fq.gz;
+
+    cat $RM/fastq/HOT_F100_9_${i}.fq.gz $RM/fastq/HOT_F100_92_${i}.fq.gz > $RM/fastq/HOT_F100_93_${i}.fq.gz;
+    mv $RM/fastq/HOT_F100_93_${i}.fq.gz $RM/fastq/HOT_F100_9_${i}.fq.gz;
+    rm $RM/fastq/HOT_F100_92_${i}.fq.gz;
+done
+
+basename $RM/fastq/*_2.fq.gz | rev | cut -d "_" -f2- | rev > $RM/fastq/sample.list
+```
+
+## Removing the PCR primers from the reads
+
+We use the software cutadapt (v3.4) to remove the primers from the amplicon sequencing. Unlike in WGS, there are no Illumina adapters, we have to remove the forward and reverse primers. The flag `-g` refers to the forward primer attached at 5' of the forward read, and `-G` is the reverse primer attached to the 5' of the reverse read. `^` means that the primers will be found at the beginning of the string. If they were 3', we would use `$` in the end, but they are not.
+
+```{bash Removing PCR primers, message=FALSE, warning=FALSE, results='hide'}
+RAW=~/PhD/Amplicon_sequencing/Old_16S/01.Raw_data
+RM=~/PhD/Amplicon_sequencing/Old_16S/02.Rm_adapters
+
+cutadapt --version
+
+for i in $(cat $RM/fastq/sample.list)
+do
+
+    echo "On sample: $i"
+    
+    cutadapt -g ^CCTACGGGNGGCWGCAG \
+    -G ^GACTACHVGGGTATCTAATCC \
+    --discard-untrimmed \
+    --pair-adapters \
+    -m 100 \
+    -o $RM/fastq_wo_adapt/${i}.RmAdp_1.fq.gz -p $RM/fastq_wo_adapt/${i}.RmAdp_2.fq.gz \
+    $RM/fastq/${i}_1.fq.gz $RM/fastq/${i}_2.fq.gz \
+    >> $RM/fastq_wo_adapt/cutadapt_primer_trimming_stats.txt 2>&1
+
+done
+
+#We create a new sample.list with the file names
+basename $RM/fastq_wo_adapt/*.RmAdp_2.fq.gz | cut -d "_" -f1,2,3 | cut -d "." -f1 > $RM/fastq_wo_adapt/sample.list
+```
+
+## Assessing the quality of the reads
+
+We asses the quality of the reads before and after removing the primers.
+
+```{bash Assessing reads quality, message=FALSE, warning=FALSE, results='hide'}
+RAW=~/PhD/Amplicon_sequencing/Old_16S/01.Raw_data
+RM=~/PhD/Amplicon_sequencing/Old_16S/02.Rm_adapters
+
+fastqc --version
+for i in $(cat $RM/fastq/sample.list)
+do
+fastqc $RM/fastq/${i}_1.fq.gz $RM/fastq/${i}_2.fq.gz -o $RM/fastqc
+fastqc $RM/fastq_wo_adapt/${i}.RmAdp_1.fq.gz $RM/fastq_wo_adapt/${i}.RmAdp_2.fq.gz -o $RM/fastqc_wo_adapt
+done
+```
+
+## Amplicon sequencing analysis
+
+Now the reads are ready for Amplicon Sequencing Analysis. The commands to do it are in the scripts "Amplicon_sequencing.Rmd" and "Analysis.Rmd". Have fun 😃.

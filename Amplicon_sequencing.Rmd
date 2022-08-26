@@ -1,0 +1,236 @@
+---
+title: "Amplicon_sequencing_processing"
+author: "Bosco Gracia Alvira"
+date: "2022-08-09"
+output: md_document
+---
+
+This script is based on [AstroMike amplicon sequencing tutorial](https://astrobiomike.github.io/amplicon/dada2_workflow_ex){.uri}:
+
+## Library loading
+
+```{r Packages, message=FALSE, warning=FALSE}
+library(dada2) ; packageVersion("dada2")
+library(DECIPHER) ; packageVersion("DECIPHER")
+library(ShortRead) ; packageVersion("ShortRead")
+```
+
+```{r Set working directory, message=FALSE, warning=FALSE}
+setwd("/Users/bgracia/PhD/Amplicon_sequencing/Old_16S/")
+
+list.files() # make sure what we think is here is actually here
+```
+
+```{r Files preparation, message=FALSE, warning=FALSE}
+# one with all sample names, by scanning our "samples" file we made earlier
+samples <- scan("02.Rm_adapters/fastq_wo_adapt/sample.list", what="character")
+
+# one holding the file names of all the forward reads
+forward_reads <- paste0("02.Rm_adapters/fastq_wo_adapt/",samples,".RmAdp_1.fq.gz")
+# and one with the reverse
+reverse_reads <- paste0("02.Rm_adapters/fastq_wo_adapt/",samples,".RmAdp_2.fq.gz")
+
+# and variables holding file names for the forward and reverse
+# filtered reads we're going to generate below
+filtered_forward_reads <- paste0("03.DADA2/fastq_filtered/",samples, "_filtered_1.fq.gz")
+filtered_reverse_reads <- paste0("03.DADA2/fastq_filtered/",samples, "_filtered_2.fq.gz")
+```
+
+## Quality trimming/filtering
+
+Even though we have already run FastQC, we can plot the quality profiles again in order to decide in which base we are truncating the reads.
+
+```{r Quality profile, message=FALSE, warning=FALSE}
+plotQualityProfile(forward_reads[1:2])
+plotQualityProfile(reverse_reads[1:2])
+```
+
+With `filterAndTrim` we filter the reads that have more than 2 expected errors and any N, remove any PhiX sequence and truncate the reads (95 bp forward and 90 reverse). `truncLen` parameter is somehow arbitrary. I have truncated were the median quality score falls below 30 in the quality profile plots.
+
+```{r Reads filtering and trimming}
+filtered_out <- filterAndTrim(forward_reads, filtered_forward_reads,
+                              reverse_reads, filtered_reverse_reads, maxEE=c(2,2),
+                              rm.phix=TRUE, maxN=0, truncQ=2, truncLen=c(95,90))
+
+```
+
+We check the quality of the filtered reads
+
+```{r Filtered quality profile, message=FALSE, warning=FALSE}
+plotQualityProfile(filtered_forward_reads[1:2])
+plotQualityProfile(filtered_reverse_reads[1:2])
+```
+
+## Generating an error model of our data
+
+Next up is generating our error model by learning the specific error-signature of our dataset. Each sequencing run, even when all goes well, will have its own subtle variations to its error profile. This step tries to assess that for both the forward and reverse reads.
+
+```{r Error model, message=FALSE, warning=FALSE, results='hide'}
+err_forward_reads <- learnErrors(filtered_forward_reads)
+err_reverse_reads <- learnErrors(filtered_reverse_reads)
+```
+
+We can visualize how well the estimated error rates match up with the observed: the red line is what is expected based on the quality score, the black line represents the estimate, and the black dots represent the observed. Generally speaking, you want the observed (black dots) to track well with the estimated (black line).
+
+```{r Error plot, message=FALSE, warning=FALSE}
+plotErrors(err_forward_reads, nominalQ=TRUE)
+plotErrors(err_reverse_reads, nominalQ=TRUE)
+```
+
+## Dereplication
+
+Instead of keeping 100 identical sequences and doing all downstream processing to all 100, you can keep/process one of them, and just attach the number 100 to it. When DADA2 dereplicates sequences, it also generates a new quality-score profile of each unique sequence based on the average quality scores of each base of all of the sequences that were replicates of it.
+
+```{r Dereplication, message=FALSE, warning=FALSE}
+derep_forward <- derepFastq(filtered_forward_reads, verbose=TRUE)
+names(derep_forward) <- samples # the sample names in these objects are initially the file names of the samples, this sets them to the sample names for the rest of the workflow
+derep_reverse <- derepFastq(filtered_reverse_reads, verbose=TRUE)
+names(derep_reverse) <- samples
+```
+
+## Inferring ASVs
+
+DADA2 tries to infer true biological sequences by incorporating the consensus quality profiles and abundances of each unique sequence, and then figuring out if each sequence is more likely to be of biological origin or more likely to be spurious. Here we're using pseudo-pooling, i.e., spurious ASVs are decided taken into account their presence in all the samples (an ASV could look an artifact in sample 3, but be very abundant in sample 2...).
+
+```{r Dada, message=FALSE, warning=FALSE, results = 'hide'}
+dada_forward <- dada(derep_forward, err=err_forward_reads, pool="pseudo")
+dada_reverse <- dada(derep_reverse, err=err_reverse_reads, pool="pseudo")
+```
+
+## Merging forward and reverse reads
+
+This command merges each reads pair based on their overlapping sequence. In our case reads don't overlap (amplicon size is 450 bp and reads are 125 bp), so we just concatenate them without control, I hope everything is okay xd
+
+```{r Merging reads, message=FALSE, warning=FALSE}
+merged_amplicons <- mergePairs(dada_forward, derep_forward, dada_reverse,
+                               derep_reverse, justConcatenate=TRUE)
+```
+
+## Generating a count table
+
+We generate a table with the ASV counts in each sample.
+
+```{r Count table, message=FALSE, warning=FALSE, results='hide'}
+seqtab <- makeSequenceTable(merged_amplicons)
+colnames(seqtab) #The column names are the amplicon sequences
+```
+
+## Chimera identification
+
+DADA2 identifies likely chimeras by aligning each sequence with those that were recovered in greater abundance and then seeing if there are any lower-abundance sequences that can be made exactly by mixing left and right portions of two of the more-abundant ones.
+
+```{r Chimera identification}
+seqtab.nochim <- removeBimeraDenovo(seqtab, verbose=T) 
+sum(seqtab.nochim)/sum(seqtab) 
+```
+
+The majority of the ASVs (848/1065) are detected as chimeras and removed. However, they only account for 3.2% of the reads.
+
+## Overview of counts throughout
+
+As a final check of our progress, we'll look at the number of reads that made it through each step in the pipeline:
+
+```{r Filtering summary table, message=FALSE, warning=FALSE}
+getN <- function(x) sum(getUniques(x))
+
+summary_tab <- data.frame(row.names=samples, dada2_input=filtered_out[,1],
+                          filtered=filtered_out[,2], dada_f=sapply(dada_forward, getN),
+                          dada_r=sapply(dada_reverse, getN), merged=sapply(merged_amplicons, getN),
+                          nonchim=rowSums(seqtab.nochim),
+                          reads_retained=round(rowSums(seqtab.nochim)/filtered_out[,1]*100, 1))
+
+head(summary_tab)
+
+write.table(summary_tab, "03.DADA2/read-count-tracking.tsv", quote=FALSE, sep="\t", col.names=NA)
+```
+
+## Extracting the ASVs in FASTA file
+
+```{r ASVs to FASTA}
+# giving our seq headers more manageable names (ASV_1, ASV_2...)
+asv_seqs <- colnames(seqtab.nochim)
+asv_headers <- vector(dim(seqtab.nochim)[2], mode="character")
+
+for (i in 1:dim(seqtab.nochim)[2]) {
+  asv_headers[i] <- paste(">ASV", i, sep="_")
+}
+
+# making and writing out a fasta of our final ASV seqs:
+asv_fasta <- c(rbind(asv_headers, asv_seqs))
+write(asv_fasta, "03.DADA2/ASVs.fa")
+asv_fasta[1:6]
+```
+
+## Taxonomy assignment
+
+To assign taxonomy, we are going to use the DECIPHER package. There are some DECIPHER-formatted databases available here, which is where the SILVA v138 comes from that we will use below.
+
+```{r Database download, message=FALSE, warning=FALSE}
+#Only download the file the first time
+#download.file(url="http://www2.decipher.codes/Classification/TrainingSets/SILVA_SSU_r138_2019.RData", destfile="03.DADA2/SILVA_SSU_r138_2019.RData")
+
+load("03.DADA2/SILVA_SSU_r138_2019.RData")
+```
+
+We create a DNAStringSet object of our ASVs and use DECIPHER to predict the taxonomy of each ASV and save the data into an R file, than can be loaded instead of creating it again in the next session.
+
+```{r Taxonomy assignment, message=FALSE, warning=FALSE, results='hide'}
+dna <- DNAStringSet(getSequences(seqtab.nochim))
+
+tax_info <- IdTaxa(test=dna, trainingSet=trainingSet, strand="both", processors=NULL)
+save(tax_info, file="03.DADA2/tax_info.RData")
+
+#load("03.DADA2/tax_info.RData")
+```
+
+```{r tax_info}
+tax_info[1:6,1:6]
+```
+
+In order to assign the ASVs at species level, specially the *Acetobacter* ones, I will use the DADA2 program `assignSpecies()`., that only allows exact matches. It does not work with Ns, so we have to choose either the forward or the reverse read to do the analysis. I am extracting the reverse because it is more variable.
+
+```{r}
+# download.file(url="https://zenodo.org/record/4587955/files/silva_species_assignment_v138.1.fa.gz?download=1", destfile="03.DADA2/silva_species_assignment_v138.1.fa.gz") This needs to be done only once.
+
+# define tag
+tag <- "NNNN"
+
+# remove any character(s) before tag, including tag.
+Rev_read <- gsub(paste0("^.*",tag),"",asv_seqs)
+
+#Here we cbind the name of each ASV with the assignSpecies result
+genus.species <- cbind(asv_headers,assignSpecies((Rev_read), "03.DADA2/silva_species_assignment_v138.1.fa.gz", allowMultiple=TRUE))
+colnames(genus.species) <- c("Id","Genus","Species")
+
+write.table(genus.species, "03.DADA2/ASVs_species.tsv", sep = "\t", quote=F, col.names=NA)
+
+```
+
+The resolution at species level is terrible, our *Acetobacter* ASVs could be anything.
+
+## Extracting the standard goods from DADA2
+
+The typical standard outputs from amplicon processing are a fasta file, a count table, and a taxonomy table. So here's one way we can generate those files from your DADA2 objects in R:
+
+```{r Data extraction, message=FALSE, warning=FALSE}
+# count table:
+asv_tab <- t(seqtab.nochim)
+row.names(asv_tab) <- sub(pattern=">", replacement="", x=asv_headers)
+write.table(asv_tab, "03.DADA2/ASVs_counts.tsv", sep="\t", quote=F, col.names=NA)
+asv_tab[1:6,1:6]
+
+# tax table:
+# creating table of taxonomy and setting any that are unclassified as "NA"
+ranks <- c("domain", "phylum", "class", "order", "family", "genus", "species", "ASV")
+asv_tax <- t(sapply(tax_info, function(x) {
+  m <- match(ranks, x$rank)
+  taxa <- x$taxon[m]
+  taxa[startsWith(taxa, "unclassified_")] <- NA
+  taxa
+}))
+colnames(asv_tax) <- ranks
+rownames(asv_tax) <- gsub(pattern=">", replacement="", x=asv_headers)
+row.names(asv_tax) -> asv_tax[,8]
+write.table(asv_tax, "03.DADA2/ASVs_taxonomy.tsv", sep = "\t", quote=F, col.names=NA)
+asv_tax[1:6,]
+```
